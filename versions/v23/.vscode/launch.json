@@ -1,0 +1,15 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "运行二维超声校正 Image v23",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ultrasound_bin_gui.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\timiy\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+      "justMyCode": true
+    }
+  ]
+}

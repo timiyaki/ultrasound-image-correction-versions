@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "运行超声 BIN 校正工具",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ultrasound_bin_gui.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\timiy\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+      "justMyCode": true
+    },
+    {
+      "name": "运行三维超声查看器",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/ultrasound_3d_viewer.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "python": "C:\\Users\\timiy\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+      "justMyCode": true
+    }
+  ]
+}
