@@ -11,7 +11,10 @@ SAFE_SUFFIXES = {".py", ".md", ".txt", ".bat", ".json", ".code-workspace", ".pat
 for version in ("v28", "v29"):
     source = ROOT / "versions" / version
     destination = ROOT / "packages" / f"{version}.zip"
-    files = sorted(path for path in source.rglob("*") if path.is_file())
+    files = sorted(
+        path for path in source.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    )
     if not files or any(path.suffix.lower() not in SAFE_SUFFIXES for path in files):
         raise RuntimeError(f"Unexpected file in {source}")
     with ZipFile(destination, "w", ZIP_DEFLATED, compresslevel=9) as archive:
