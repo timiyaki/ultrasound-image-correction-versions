@@ -1,8 +1,0 @@
-{
-  "folders": [{ "path": "." }],
-  "settings": {
-    "python.defaultInterpreterPath": "C:\\Users\\timiy\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
-    "python.terminal.activateEnvironment": true,
-    "files.encoding": "utf8"
-  }
-}
