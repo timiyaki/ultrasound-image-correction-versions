@@ -14,8 +14,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 
+from edge_enhance_0913 import apply_edge_response, enhance_boundaries, prepare_edge_response
 
-APP_TITLE = "超声图像灰度校正工具 Image v28 · Lee + 双边滤波"
+
+APP_TITLE = "超声图像灰度校正工具 Image v29 · 0913 方向自适应边缘增强"
 COMMON_WIDTHS = (128, 192, 256, 320, 384, 480, 512, 640, 768, 800, 1024, 1280, 1920)
 CAPTURE_FILENAMES = ("raw_frames_u8.bin", "frames.json", "scan.snp", "integrity.json")
 
@@ -37,7 +39,7 @@ class ProcessParams:
     despeckle_strength: float = 0.80
     bilateral_strength: float = 0.45
     bilateral_sigma: float = 0.06
-    edge_gain: float = 0.35
+    edge_gain: float = 1.00
     red_outline_enabled: bool = True
     red_outline_threshold: float = 150.0
     blue_outline_threshold: float = 225.0
@@ -220,8 +222,8 @@ def validate_params(path: Path, p: ProcessParams) -> int:
         raise ValueError("双边滤波强度应在 0–1 之间。")
     if not 0.01 <= p.bilateral_sigma <= 0.20:
         raise ValueError("双边相似尺度应在 0.01–0.20 之间。")
-    if not 0.0 <= p.edge_gain <= 2.5:
-        raise ValueError("主体边界增强应在 0–2.5 之间。")
+    if not 0.0 <= p.edge_gain <= 3.0:
+        raise ValueError("0913 边缘增强 Gain 应在 0–3.0 之间。")
     if not 80.0 <= p.red_outline_threshold <= 254.0:
         raise ValueError("红色整体区域阈值应在 80–254 之间。")
     if not 128.0 <= p.blue_outline_threshold <= 255.0:
@@ -403,79 +405,6 @@ def compensate_bone_shadow(
         "maximum_lift": float(42.0 * strength),
         "warning": "Display-only compensation; hidden anatomy is not reconstructed.",
     }
-
-
-def enhance_boundaries(frames: np.ndarray, gain: float) -> np.ndarray:
-    """Enhance one-sided anatomical ridges without drawing a duplicate halo."""
-    output = np.empty_like(frames)
-    pixels_per_frame = max(frames.shape[1] * frames.shape[2], 1)
-    chunk_size = max(1, min(len(frames), 8_000_000 // pixels_per_frame))
-    for start in range(0, len(frames), chunk_size):
-        end = min(start + chunk_size, len(frames))
-        src = frames[start:end].astype(np.float32)
-        smooth = box_mean(src, 1)
-        fine = src - smooth
-        broad = src - box_mean(src, 3)
-
-        # A broad unsharp mask creates the familiar bright/dark pair beside a
-        # real contour.  Image v21 keeps almost all energy at the finest scale,
-        # then retains only the locally dominant bright ridge.  The negative
-        # wave is deliberately almost silent instead of being drawn as a second
-        # dark contour.
-        detail = 0.96 * fine + 0.04 * broad
-        positive = np.maximum(detail - 1.6, 0.0)
-        negative = np.minimum(detail + 1.6, 0.0) * 0.06
-
-        padded = np.pad(src, ((0, 0), (1, 1), (1, 1)), mode="reflect")
-        neighbors = [
-            padded[:, dy : dy + src.shape[1], dx : dx + src.shape[2]]
-            for dy in range(3)
-            for dx in range(3)
-        ]
-        local_min = np.minimum.reduce(neighbors)
-        local_max = np.maximum.reduce(neighbors)
-        local_range = local_max - local_min
-
-        positive_pad = np.pad(positive, ((0, 0), (1, 1), (1, 1)), mode="reflect")
-        positive_peak = np.maximum.reduce(
-            [
-                positive_pad[:, dy : dy + src.shape[1], dx : dx + src.shape[2]]
-                for dy in range(3)
-                for dx in range(3)
-            ]
-        )
-        ridge_ratio = positive / np.maximum(positive_peak, 1e-5)
-        ridge_gate = np.clip((ridge_ratio - 0.58) / 0.42, 0.0, 1.0)
-
-        smooth_pad = np.pad(smooth, ((0, 0), (1, 1), (1, 1)), mode="reflect")
-        coherent_gradient = np.maximum.reduce(
-            [
-                np.abs(smooth - smooth_pad[:, dy : dy + src.shape[1], dx : dx + src.shape[2]])
-                for dy, dx in ((0, 1), (2, 1), (1, 0), (1, 2))
-            ]
-        )
-
-        # A coherent-gradient gate rejects isolated speckles.  Only the crest of
-        # a true transition receives full sharpening, while the flanks get a
-        # small fraction so the contour remains continuous rather than jagged.
-        edge_gate = np.clip((local_range - 5.0) / 20.0, 0.0, 1.0)
-        coherence_gate = np.clip((coherent_gradient - 1.5) / 12.0, 0.0, 1.0)
-        tissue_gate = np.clip((src - 10.0) / 48.0, 0.0, 1.0)
-        highlight_gate = np.clip((248.0 - src) / 30.0, 0.0, 1.0)
-        bright_ridge = np.minimum(positive, 28.0) * (0.18 + 0.82 * ridge_gate)
-        limited_detail = bright_ridge * highlight_gate + np.maximum(negative, -3.0)
-        candidate = src + gain * tissue_gate * edge_gate * limited_detail
-        candidate = src + coherence_gate * (candidate - src)
-
-        # Keep the result close to the observed 3x3 range.  The smaller v21
-        # margin is important: an artificial extremum is perceived as a ghost
-        # even when its absolute gray difference is modest.
-        margin = np.clip(local_range * 0.055, 1.0, 4.0)
-        enhanced = np.minimum(np.maximum(candidate, local_min - margin), local_max + margin)
-        enhanced = np.clip(enhanced, 0.0, 255.0)
-        enhanced[frames[start:end] == 0] = 0.0
-        output[start:end] = np.rint(enhanced).astype(np.uint8)
-    return output
 
 
 def diffused_region_mask(
@@ -940,30 +869,37 @@ def process_frames(
     p: ProcessParams,
     progress: Callable[[float, str], None] | None = None,
     calibration_frames: np.ndarray | None = None,
+    calibration_values: tuple[float, float] | None = None,
+    filtered_frames: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     calibration_source = frames if calibration_frames is None else calibration_frames
-    noise_var = estimate_noise_variance(calibration_source, p)
-    # Estimate one common white point to preserve brightness relationships between frames.
-    sample_ids = np.linspace(
-        0, len(calibration_source) - 1, min(16, len(calibration_source)), dtype=int
-    )
-    filtered_sample = filter_chunk(calibration_source[sample_ids], p, noise_var)
-    # Do not let zero-valued pixels outside/inside the acquisition footprint
-    # pull the white point downward.  Tone statistics must represent echoes in
-    # the active scan region rather than the black canvas around it.
-    active_sample = calibration_source[sample_ids] > p.black_level
-    white_values = filtered_sample[active_sample]
-    if white_values.size == 0:
-        white_values = filtered_sample.reshape(-1)
-    white = float(np.percentile(white_values, p.white_percentile))
-    white = max(white, 1.0)
+    if calibration_values is None:
+        noise_var = estimate_noise_variance(calibration_source, p)
+        # Estimate one common white point to preserve brightness relationships.
+        sample_ids = np.linspace(
+            0, len(calibration_source) - 1, min(16, len(calibration_source)), dtype=int
+        )
+        filtered_sample = filter_chunk(calibration_source[sample_ids], p, noise_var)
+        active_sample = calibration_source[sample_ids] > p.black_level
+        white_values = filtered_sample[active_sample]
+        if white_values.size == 0:
+            white_values = filtered_sample.reshape(-1)
+        white = max(float(np.percentile(white_values, p.white_percentile)), 1.0)
+    else:
+        noise_var, white = calibration_values
+    if filtered_frames is not None and filtered_frames.shape != frames.shape:
+        raise ValueError("Cached filtered frames do not match input shape")
 
     output = np.empty_like(frames)
     shadow_reports: list[dict] = []
     chunk_size = max(1, min(16, 24_000_000 // max(frames.shape[1] * frames.shape[2], 1)))
     for start in range(0, len(frames), chunk_size):
         end = min(start + chunk_size, len(frames))
-        filtered = filter_chunk(frames[start:end], p, noise_var)
+        filtered = (
+            filtered_frames[start:end]
+            if filtered_frames is not None
+            else filter_chunk(frames[start:end], p, noise_var)
+        )
         normalized = np.clip(filtered / white, 0.0, 1.0)
         # Combined contrast/brightness/gamma correction:
         # y = 255 * clip(alpha*x + beta/255, 0, 1) ** gamma
@@ -1001,7 +937,7 @@ def process_frames(
         output = enhance_boundaries(output, p.edge_gain)
 
     meta = {
-        "algorithm": "support-aware log-domain adaptive Lee + single-pass bilateral + peripheral wall-reflection separation + one-sided ridge boundary enhancement",
+        "algorithm": "support-aware log-domain adaptive Lee + single-pass bilateral + peripheral wall-reflection separation + edgeEnhance-0913 directional boundary enhancement",
         "denoising": {
             "despeckle": "adaptive Lee", "lee_strength": p.despeckle_strength,
             "filter": "bilateral", "bilateral_strength": p.bilateral_strength,
@@ -1025,6 +961,14 @@ def process_frames(
             "warning": "仅作显示补偿，不代表恢复被骨骼遮挡的真实组织。",
         },
         "fetal_wall_separation": separation_report,
+        "edge_enhancement": {
+            "source": "edgeEnhance-0913/extract_main_boundary.m and edgeEnhanceApp.m defaults",
+            "method": "structure tensor + tangential smoothing + normal sharpening + soft confidence gate",
+            "gain": p.edge_gain,
+            "direction_count": 16,
+            "contour_detection_ported": False,
+            "optional_post_tone_curve_ported": False,
+        },
         "parameters": asdict(p),
         "input_shape": list(frames.shape),
         "output_shape": list(output.shape),
@@ -1042,6 +986,119 @@ def process_frames(
         "processing_mode": "one shared parameter set for all frames",
     }
     return output, meta
+
+
+class PreviewRenderer:
+    """Reuse group calibration and unchanged processing stages between edits.
+
+    This object is owned by one preview worker thread. Export continues to use
+    the uncached full-resolution `process_frames` path.
+    """
+
+    def __init__(self):
+        self.dataset_ref = None
+        self.noise_key = None
+        self.filter_key = None
+        self.filtered_key = None
+        self.base_key = None
+        self.response_key = None
+        self.corrected_key = None
+        self.dsc_key = None
+
+    @staticmethod
+    def _preview_edge_response(frame: np.ndarray, exact_edges: bool) -> np.ndarray:
+        if exact_edges or max(frame.shape) <= 512:
+            return prepare_edge_response(frame)
+        height, width = frame.shape
+        scale = 512.0 / max(height, width)
+        small_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        small = np.asarray(Image.fromarray(frame, mode="L").resize(small_size, Image.Resampling.BILINEAR))
+        response = prepare_edge_response(small)
+        upscaled = Image.fromarray(response, mode="F").resize((width, height), Image.Resampling.BILINEAR)
+        result = np.asarray(upscaled, dtype=np.float32).copy()
+        result[frame == 0] = 0.0
+        return result
+
+    def render(
+        self, raw: np.ndarray, frame_index: int, p: ProcessParams,
+        exact_edges: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        if raw is not self.dataset_ref:
+            self.__init__()
+            self.dataset_ref = raw
+
+        noise_key = (p.black_level, p.lee_window, p.noise_percentile)
+        if noise_key != self.noise_key:
+            self.noise_var = estimate_noise_variance(raw, p)
+            self.noise_key = noise_key
+
+        filter_key = (
+            noise_key, p.original_blend, p.despeckle_strength,
+            p.bilateral_strength, p.bilateral_sigma,
+        )
+        if filter_key != self.filter_key:
+            sample_ids = np.linspace(0, len(raw)-1, min(16, len(raw)), dtype=int)
+            sample_raw = raw[sample_ids]
+            sample_filtered = filter_chunk(sample_raw, p, self.noise_var)
+            active = sample_raw > p.black_level
+            self.white_values = sample_filtered[active]
+            if not self.white_values.size:
+                self.white_values = sample_filtered.reshape(-1)
+            self.filter_key = filter_key
+
+        filtered_key = (frame_index, filter_key)
+        if filtered_key != self.filtered_key:
+            self.filtered_frame = filter_chunk(raw[frame_index:frame_index+1], p, self.noise_var)
+            self.filtered_key = filtered_key
+        white = max(float(np.percentile(self.white_values, p.white_percentile)), 1.0)
+
+        geometry = (
+            p.dsc_enabled, p.dsc_angle_deg, p.dsc_inner_radius,
+            p.dsc_output_width, p.dsc_output_height,
+        )
+        base_key = (
+            filtered_key, p.white_percentile, p.alpha, p.beta, p.gamma,
+            p.shadow_fill_enabled, p.shadow_fill_strength, geometry,
+        )
+        if base_key != self.base_key:
+            base, meta = process_frames(
+                raw[frame_index:frame_index+1],
+                replace(p, edge_gain=0.0),
+                calibration_frames=raw,
+                calibration_values=(self.noise_var, white),
+                filtered_frames=self.filtered_frame,
+            )
+            self.base_frame = base[0]
+            self.base_meta = meta
+            self.base_key = base_key
+
+        response_key = (base_key, exact_edges)
+        if p.edge_gain > 0.0 and self.response_key != response_key:
+            self.edge_response = self._preview_edge_response(self.base_frame, exact_edges)
+            self.response_key = response_key
+        corrected_key = (response_key, p.edge_gain)
+        if corrected_key != self.corrected_key:
+            if p.edge_gain > 0.0:
+                self.corrected_frame = apply_edge_response(self.base_frame, self.edge_response, p.edge_gain)
+            else:
+                self.corrected_frame = self.base_frame
+            self.corrected_key = corrected_key
+            self.corrected_stats = stats(self.corrected_frame[None, ...])
+
+        dsc_key = (frame_index, geometry)
+        if dsc_key != self.dsc_key:
+            self.dsc_only = (
+                dsc_scan_convert(raw[frame_index:frame_index+1], p)[0]
+                if p.dsc_enabled else raw[frame_index]
+            )
+            self.dsc_key = dsc_key
+
+        meta = dict(self.base_meta)
+        meta["parameters"] = asdict(p)
+        meta["processed_statistics"] = self.corrected_stats
+        meta["edge_enhancement"] = {**self.base_meta["edge_enhancement"], "gain": p.edge_gain}
+        meta["preview_edge_mode"] = "full resolution" if exact_edges else "display resolution when larger than 512 px"
+        return raw[frame_index], self.dsc_only, self.corrected_frame, meta
 
 
 def auto_tune_frame(frame: np.ndarray, p: ProcessParams) -> tuple[dict, dict]:
@@ -1063,10 +1120,9 @@ def auto_tune_frame(frame: np.ndarray, p: ProcessParams) -> tuple[dict, dict]:
     despeckle_strength = float(np.clip(0.72 + residual * 1.2, 0.72, 0.92))
     bilateral_strength = float(np.clip(0.30 + residual * 1.4, 0.30, 0.55))
     bilateral_sigma = float(np.clip(0.035 + residual * 0.30, 0.035, 0.075))
-    # The v21 ridge detector needs less gain than the older two-sided unsharp
-    # mask.  This range keeps the true crest clear without recreating a nearby
-    # dark/bright echo.
-    edge_gain = float(np.clip(1.66 - residual * 2.0, 1.45, 1.65))
+    # The 0913 Gain multiplies the full directional response, so its useful
+    # range differs from v28's one-sided ridge strength. Keep noisy scans mild.
+    edge_gain = float(np.clip(1.10 - residual * 0.8, 0.85, 1.10))
 
     tune = replace(
         p,
@@ -1271,7 +1327,7 @@ def process_frames_individually(
             )
     output = np.stack(rendered, axis=0)
     return output, {
-        "algorithm": "per-frame auto-tuned log-domain adaptive Lee and bilateral filtering, alpha-beta-gamma correction and halo-suppressed boundary enhancement",
+        "algorithm": "per-frame auto-tuned log-domain adaptive Lee and bilateral filtering, alpha-beta-gamma correction and edgeEnhance-0913 directional boundary enhancement",
         "processing_mode": "independent parameters for every frame",
         "parameters": asdict(p),
         "per_frame": frame_metadata,
@@ -1533,6 +1589,9 @@ class UltrasoundApp(tk.Tk):
         self.current_processed: np.ndarray | None = None
         self.live_preview_job = None
         self.live_preview_generation = 0
+        self._preview_condition = threading.Condition()
+        self._pending_live_preview = None
+        self._preview_renderer = PreviewRenderer()
         self.frame_auto_params: dict[int, dict] = {}
         self._applying_frame_params = False
         self.subject_masks: np.ndarray | None = None
@@ -1543,7 +1602,8 @@ class UltrasoundApp(tk.Tk):
         self._brush_erasing = False
         self.is_busy = False
         self._build_ui()
-        self.after(100, self._poll_queue)
+        threading.Thread(target=self._preview_worker, daemon=True).start()
+        self.after(50, self._poll_queue)
 
     def _build_ui(self):
         self.columnconfigure(1, weight=1)
@@ -1607,7 +1667,8 @@ class UltrasoundApp(tk.Tk):
         self.despeckle_var = tk.DoubleVar(value=0.80)
         self.bilateral_var = tk.DoubleVar(value=0.45)
         self.bilateral_sigma_var = tk.DoubleVar(value=0.06)
-        self.edge_var = tk.DoubleVar(value=0.35)
+        self.edge_var = tk.DoubleVar(value=1.00)
+        self.precise_preview_var = tk.BooleanVar(value=False)
         self._grid_field(params, 0, "黑电平", self.black_var)
         self._grid_field(params, 1, "白点百分位", self.white_var)
         self._slider_field(params, 2, "α 对比度增益", self.alpha_var, 0.50, 2.00, 0.01)
@@ -1620,7 +1681,7 @@ class UltrasoundApp(tk.Tk):
         self._slider_field(params, 6, "噪声百分位", self.noise_var, 5.0, 50.0, 1.0)
         self._slider_field(params, 7, "原始细节混合", self.blend_var, 0.0, 0.50, 0.01)
         self._slider_field(params, 8, "Lee 去散斑强度", self.despeckle_var, 0.0, 1.00, 0.05)
-        self._slider_field(params, 9, "边缘清晰度增强", self.edge_var, 0.0, 2.00, 0.05)
+        self._slider_field(params, 9, "边缘增强", self.edge_var, 0.0, 3.00, 0.05)
         self._slider_field(params, 10, "双边滤波强度", self.bilateral_var, 0.0, 1.0, 0.05)
         self._slider_field(params, 11, "双边灰度相似尺度", self.bilateral_sigma_var, 0.01, 0.20, 0.005)
         presets = ttk.Frame(params)
@@ -1630,6 +1691,10 @@ class UltrasoundApp(tk.Tk):
         ttk.Button(presets, text="增强", command=lambda: self._set_abg(1.20, 5, 0.85)).pack(side="left", expand=True, fill="x")
         self.auto_button = ttk.Button(params, text="自动（整组统一）", command=self._auto_adjust)
         self.auto_button.grid(row=13, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Checkbutton(
+            params, text="精确边缘预览（较慢；导出始终为全分辨率）",
+            variable=self.precise_preview_var, command=self._on_live_parameter_change,
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(5, 0))
 
         shadow = ttk.LabelFrame(controls, text="骨骼声影补偿（可选）", padding=10)
         shadow.pack(fill="x", pady=(0, 10))
@@ -1850,10 +1915,11 @@ class UltrasoundApp(tk.Tk):
 
     def _load_capture(self):
         preferred_index = self._current_frame_index()
+        selected_folder = Path(self.folder_var.get())
 
         def task():
             try:
-                info = read_capture_metadata(Path(self.folder_var.get()))
+                info = read_capture_metadata(selected_folder)
                 self.task_queue.put(("capture_loaded", info, preferred_index))
             except Exception as exc:
                 self.task_queue.put(("error", str(exc)))
@@ -1947,7 +2013,7 @@ class UltrasoundApp(tk.Tk):
             self.despeckle_var.set(values.get("despeckle_strength", 0.80))
             self.bilateral_var.set(values.get("bilateral_strength", 0.45))
             self.bilateral_sigma_var.set(values.get("bilateral_sigma", 0.06))
-            self.edge_var.set(values.get("edge_gain", 0.35))
+            self.edge_var.set(values.get("edge_gain", 1.00))
             self.shadow_strength_var.set(values.get("shadow_fill_strength", 0.45))
         finally:
             self._applying_frame_params = False
@@ -1985,11 +2051,15 @@ class UltrasoundApp(tk.Tk):
         self._invalidate_live_preview()
         if preferred_index is None:
             preferred_index = self._current_frame_index()
+        try:
+            path, params = Path(self.input_var.get()), self._params()
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, str(exc))
+            return
 
         def task():
             try:
-                path, p = Path(self.input_var.get()), self._params()
-                raw = read_frames(path, p)
+                raw = read_frames(path, params)
                 self.task_queue.put(("preview_loaded", raw, preferred_index))
             except Exception as exc:
                 self.task_queue.put(("error", str(exc)))
@@ -2222,7 +2292,7 @@ class UltrasoundApp(tk.Tk):
                     messagebox.showinfo(APP_TITLE, f"处理完成。\n\nBIN：{files[0]}\nPNG：{files[1]}\n对比图：{files[2]}")
         except queue.Empty:
             pass
-        self.after(100, self._poll_queue)
+        self.after(50, self._poll_queue)
 
     def _current_frame_index(self) -> int:
         if self.raw is None:
@@ -2360,14 +2430,16 @@ class UltrasoundApp(tk.Tk):
         self._run_task(task)
 
     def _on_live_parameter_change(self, _value=None):
+        if self._applying_frame_params:
+            return
         self._remember_current_frame_params()
-        self._schedule_live_preview()
+        self._schedule_live_preview(delay_ms=35)
 
     def _on_traced_parameter_change(self, *_args):
         if self._applying_frame_params:
             return
         self._remember_current_frame_params()
-        self._schedule_live_preview(delay_ms=260)
+        self._schedule_live_preview(delay_ms=180)
 
     def _on_frame_change(self, _value=None):
         if self.raw is None:
@@ -2382,17 +2454,14 @@ class UltrasoundApp(tk.Tk):
         self.outline_label.configure(image="", text="正在生成红/蓝双层描边…")
         self._schedule_live_preview(delay_ms=30)
 
-    def _schedule_live_preview(self, _value=None, delay_ms: int = 120):
+    def _schedule_live_preview(self, _value=None, delay_ms: int = 35):
         if self.raw is None:
             return
-        if self.live_preview_job is not None:
-            try:
-                self.after_cancel(self.live_preview_job)
-            except tk.TclError:
-                pass
         self.live_preview_generation += 1
-        generation = self.live_preview_generation
-        self.live_preview_job = self.after(delay_ms, lambda: self._start_live_preview(generation))
+        # Throttle instead of debounce: dragging a slider must produce interim
+        # frames, not wait until the user releases the mouse.
+        if self.live_preview_job is None:
+            self.live_preview_job = self.after(delay_ms, self._start_live_preview)
 
     def _invalidate_live_preview(self):
         self.live_preview_generation += 1
@@ -2402,72 +2471,81 @@ class UltrasoundApp(tk.Tk):
             except tk.TclError:
                 pass
             self.live_preview_job = None
+        with self._preview_condition:
+            self._pending_live_preview = None
 
-    def _start_live_preview(self, generation: int):
+    def _start_live_preview(self):
         self.live_preview_job = None
-        if self.raw is None or generation != self.live_preview_generation:
+        if self.raw is None:
             return
+        generation = self.live_preview_generation
         frame_index = self._current_frame_index()
         try:
             params = self._params()
         except Exception as exc:
             self.status_var.set(f"参数无效：{exc}")
             return
-        frame = self.raw[frame_index : frame_index + 1].copy()
-        subject_enabled = bool(self.subject_enabled_var.get())
-        subject_masks = self.subject_masks
+        request = (
+            generation, self.raw, frame_index, params,
+            bool(self.subject_enabled_var.get()), self.subject_masks,
+            dict(self.dataset_info), bool(self.precise_preview_var.get()),
+        )
+        with self._preview_condition:
+            # Only the newest request is retained while the worker is busy.
+            self._pending_live_preview = request
+            self._preview_condition.notify()
 
-        def task():
+    def _preview_worker(self):
+        while True:
+            with self._preview_condition:
+                while self._pending_live_preview is None:
+                    self._preview_condition.wait()
+                request = self._pending_live_preview
+                self._pending_live_preview = None
+            generation, raw, frame_index, params, subject_enabled, subject_masks, dataset_info, exact_edges = request
             try:
-                corrected, meta = process_frames(
-                    frame,
-                    params,
-                    calibration_frames=self.raw,
+                original, dsc_only, corrected, meta = self._preview_renderer.render(
+                    raw, frame_index, params, exact_edges=exact_edges,
                 )
-                meta["capture_metadata"] = self.dataset_info
+                if generation != self.live_preview_generation:
+                    continue
+                meta["capture_metadata"] = dataset_info
                 meta["preview_scope"] = "current frame only"
-                dsc_only = (
-                    dsc_scan_convert(frame, params)[0]
-                    if params.dsc_enabled
-                    else frame[0]
-                )
                 outlined = (
                     add_diffused_dual_outline(
-                        corrected[0],
+                        corrected,
                         params.red_outline_threshold,
                         params.blue_outline_threshold,
                         params.red_outline_diffusion_steps,
                     )
                     if params.red_outline_enabled
-                    else corrected[0]
+                    else corrected
                 )
                 if (
                     subject_enabled
                     and subject_masks is not None
                     and frame_index < len(subject_masks)
-                    and subject_masks[frame_index].shape == corrected[0].shape
+                    and subject_masks[frame_index].shape == corrected.shape
                 ):
                     outlined = add_subject_boundary(
                         outlined,
                         subject_masks[frame_index],
-                        corrected[0],
+                        corrected,
                     )
                 self.task_queue.put(
                     (
                         "live_frame",
                         generation,
                         frame_index,
-                        frame[0],
+                        original,
                         dsc_only,
-                        corrected[0],
+                        corrected,
                         outlined,
                         meta,
                     )
                 )
             except Exception as exc:
                 self.task_queue.put(("live_error", generation, str(exc)))
-
-        threading.Thread(target=task, daemon=True).start()
 
     @staticmethod
     def _photo(frame: np.ndarray) -> ImageTk.PhotoImage:

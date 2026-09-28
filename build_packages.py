@@ -1,4 +1,4 @@
-"""Rebuild the source-only v27/v28 ZIPs with UTF-8 filenames."""
+"""Rebuild the source-only v28/v29 ZIPs with UTF-8 filenames."""
 
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parent
 SAFE_SUFFIXES = {".py", ".md", ".txt", ".bat", ".json", ".code-workspace", ".patch"}
 
 
-for version in ("v27", "v28"):
+for version in ("v28", "v29"):
     source = ROOT / "versions" / version
     destination = ROOT / "packages" / f"{version}.zip"
     files = sorted(path for path in source.rglob("*") if path.is_file())

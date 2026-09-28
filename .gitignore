@@ -11,8 +11,8 @@ integrity.json
 *.jpeg
 *.mp4
 *.zip
-!packages/v27.zip
 !packages/v28.zip
+!packages/v29.zip
 *.pt
 *.pth
 *.onnx
