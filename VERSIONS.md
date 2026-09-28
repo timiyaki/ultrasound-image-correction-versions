@@ -33,6 +33,7 @@
 | v27 | 二维去散斑、滤波与胎儿/子宫壁分离。 | [v27_FetalWallSeparation.zip](packages/v27_FetalWallSeparation.zip) |
 | v28 | 对数域自适应 Lee、单次双边滤波及亮部限幅。 | [v28_LeeBilateral.zip](packages/v28_LeeBilateral.zip) |
 | v29 | 方向自适应边缘增强、可实时调整的快速/精确预览。 | [v29_EdgeEnhance0913_LivePreview.zip](packages/v29_EdgeEnhance0913_LivePreview.zip) |
+| v30 | 逐帧读取对比度、纹理与亮部特征，自适应增强边界并限制暗侧残影；红线分割扫描区内部黑／非黑区域，蓝线描绘较亮回声区，保留手动阈值；导出三列对比图。 | [v30_逐帧自适应边缘与红蓝描边.zip](packages/v30_逐帧自适应边缘与红蓝描边.zip) |
 
 ## 无编号程序包
 
